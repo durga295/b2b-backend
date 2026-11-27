@@ -6,7 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import multer from 'multer';
 import QRCode from 'qrcode';
-import { Types } from 'mongoose';
+import mongoose, { Types } from 'mongoose';
 import { z } from 'zod';
 import { env } from '../config/env';
 import { AuditLog, Certificate, FraudAlert, Order, Organization, Passport, Product, Rfq, ServiceCase, SupplyEvent, User } from '../models';
@@ -45,8 +45,17 @@ router.get('/organizations/:id', auth, wrap(async (req, res) => { const org = aw
 router.patch('/organizations/:id', auth, wrap(async (req, res) => { if (req.user!.role !== 'admin' && req.user!.organizationId !== req.params.id) return res.status(403).json({ error: 'Organization access denied' }); const org = await Organization.findByIdAndUpdate(req.params.id, { $set: { name: req.body.name, address: req.body.address } }, { new: true, runValidators: true }); res.json(org); }));
 
 router.get('/products', wrap(async (req, res) => {
+  if (mongoose.connection.readyState !== 1) {
+    return res.status(503).json({ error: 'Product catalogue is temporarily unavailable.' });
+  }
   const page = Math.max(1, Number(req.query.page) || 1), limit = Math.min(50, Math.max(1, Number(req.query.limit) || 12));
-  const filter: any = { active: true }; if (req.query.category) filter.category = req.query.category; if (req.query.supplier) filter.manufacturerId = req.query.supplier;
+  const filter: any = { active: true };
+  if (req.query.category) filter.category = String(req.query.category);
+  if (req.query.supplier) {
+    const supplierId = String(req.query.supplier);
+    if (!Types.ObjectId.isValid(supplierId)) return res.status(400).json({ error: 'Invalid supplier identifier' });
+    filter.manufacturerId = supplierId;
+  }
   const search = String(req.query.q || '').trim();
   if (search) {
     const pattern = new RegExp(escapeRegex(search), 'i');
@@ -59,7 +68,29 @@ router.get('/products', wrap(async (req, res) => {
       { manufacturerId: { $in: orgIds } }
     ];
   }
-  const [items, total] = await Promise.all([Product.find(filter).populate('manufacturerId', 'name').sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit), Product.countDocuments(filter)]);
+  const [rawItems, total] = await Promise.all([
+    Product.find(filter).populate('manufacturerId', 'name').sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+    Product.countDocuments(filter)
+  ]);
+  const productIds = rawItems.map((item: any) => item._id);
+  const passportRows = productIds.length
+    ? await Passport.aggregate([
+        { $match: { productId: { $in: productIds }, status: 'active' } },
+        { $sort: { createdAt: -1 } },
+        { $group: { _id: '$productId', count: { $sum: 1 }, samplePublicId: { $first: '$publicId' } } }
+      ])
+    : [];
+  const passportByProduct = new Map<string, { count: number; samplePublicId: string }>(
+    passportRows.map((row: any) => [String(row._id), { count: row.count, samplePublicId: row.samplePublicId }])
+  );
+  const items = rawItems.map((item: any) => {
+    const passportMeta = passportByProduct.get(String(item._id));
+    return {
+      ...item,
+      passportCount: passportMeta?.count ?? 0,
+      samplePassportId: passportMeta?.samplePublicId ?? null
+    };
+  });
   res.json({ items, page, limit, total, pages: Math.ceil(total / limit) });
 }));
 router.get('/products/:id', wrap(async (req, res) => { const product = await Product.findById(req.params.id).populate('manufacturerId', 'name address'); if (!product) return res.status(404).json({ error: 'Product not found' }); res.json(product); }));
